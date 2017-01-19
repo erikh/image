@@ -151,15 +151,10 @@ func (m *manifestSchema2) UpdatedImageNeedsLayerDiffIDs(options types.ManifestUp
 // This does not change the state of the original Image object.
 func (m *manifestSchema2) UpdatedImage(options types.ManifestUpdateOptions) (types.Image, error) {
 	copy := *m // NOTE: This is not a deep copy, it still shares slices etc.
+
 	if options.LayerInfos != nil {
-		if len(copy.LayersDescriptors) != len(options.LayerInfos) {
-			return nil, errors.Errorf("Error preparing updated manifest: layer count changed from %d to %d", len(copy.LayersDescriptors), len(options.LayerInfos))
-		}
-		copy.LayersDescriptors = make([]descriptor, len(options.LayerInfos))
-		for i, info := range options.LayerInfos {
-			copy.LayersDescriptors[i].Digest = info.Digest
-			copy.LayersDescriptors[i].Size = info.Size
-			copy.LayersDescriptors[i].URLs = info.URLs
+		if err := copy.performEdits(options.LayerInfos); err != nil {
+			return nil, err
 		}
 	}
 
@@ -213,6 +208,50 @@ func (m *manifestSchema2) convertToManifestOCI1() (types.Image, error) {
 
 	m1 := manifestOCI1FromComponents(config, m.src, configOCIBytes, layers)
 	return memoryImageFromManifest(m1), nil
+}
+
+// Edits the layers in the manifest when called by replacing them with the
+// appropriate infos provided. This is metadata-only -- the actual layers still
+// have to get to the image.
+func (m *manifestSchema2) performEdits(infos []types.BlobInfo) error {
+	infolen := len(infos)
+
+	if infolen < 1 {
+		return errors.New("cannot edit an image down to less than one layer")
+	}
+
+	// regurgitate the image configuration for recalculation of layers in the event the layer list has been edited.
+	imageConfig := &image{}
+	blob, err := m.ConfigBlob()
+	if err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(blob, imageConfig); err != nil {
+		return err
+	}
+
+	imageConfig.History = make([]imageHistory, infolen)
+	imageConfig.RootFS.DiffIDs = make([]digest.Digest, infolen)
+	m.LayersDescriptors = make([]descriptor, infolen)
+	for i, info := range infos {
+		imageConfig.History[i] = imageHistory{}
+		imageConfig.RootFS.DiffIDs[i] = info.Digest
+		m.LayersDescriptors[i].Digest = info.Digest
+		m.LayersDescriptors[i].Size = info.Size
+		m.LayersDescriptors[i].URLs = info.URLs
+	}
+	imageConfig.RootFS.BaseLayer = m.LayersDescriptors[0].Digest.String()
+
+	// repopulate the image configuration from above
+	m.configBlob, err = json.Marshal(imageConfig)
+	if err != nil {
+		return err
+	}
+
+	m.ConfigDescriptor.Digest = digest.FromBytes(m.configBlob)
+	m.ConfigDescriptor.Size = int64(len(m.configBlob))
+	return nil
 }
 
 // Based on docker/distribution/manifest/schema1/config_builder.go
