@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/ioutil"
 	"reflect"
+	"time"
 
 	pb "gopkg.in/cheggaaa/pb.v1"
 
@@ -47,6 +48,8 @@ type imageCopier struct {
 	canModifyManifest bool
 	reportWriter      io.Writer
 	layerCopyHook     func(types.BlobInfo) bool
+	progressInterval  time.Duration
+	progress          chan types.ProgressProperties
 }
 
 // newDigestingReader returns an io.Reader implementation with contents of source, which will eventually return a non-EOF error
@@ -95,14 +98,22 @@ type Options struct {
 	SourceCtx        *types.SystemContext
 	DestinationCtx   *types.SystemContext
 	LayerCopyHook    func(types.BlobInfo) bool
+	ProgressInterval time.Duration                 // time to wait between reports to signal the progress channel
+	Progress         chan types.ProgressProperties // Reported to when ProgressInterval has arrived for a single artifact+offset.
 }
 
 // Image copies image from srcRef to destRef, using policyContext to validate source image admissibility.
 func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageReference, options *Options) error {
+	if options == nil {
+		options = &Options{}
+	}
+
 	reportWriter := ioutil.Discard
-	if options != nil && options.ReportWriter != nil {
+
+	if options.ReportWriter != nil {
 		reportWriter = options.ReportWriter
 	}
+
 	writeReport := func(f string, a ...interface{}) {
 		fmt.Fprintf(reportWriter, f, a...)
 	}
@@ -141,7 +152,7 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 	}
 
 	var sigs [][]byte
-	if options != nil && options.RemoveSignatures {
+	if options.RemoveSignatures {
 		sigs = [][]byte{}
 	} else {
 		writeReport("Getting image source signatures\n")
@@ -177,6 +188,8 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 		canModifyManifest: canModifyManifest,
 		reportWriter:      reportWriter,
 		layerCopyHook:     options.LayerCopyHook,
+		progressInterval:  options.ProgressInterval,
+		progress:          options.Progress,
 	}
 
 	if err := ic.copyLayers(); err != nil {
@@ -203,7 +216,7 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 		return err
 	}
 
-	if options != nil && options.SignBy != "" {
+	if options.SignBy != "" {
 		mech, err := signature.NewGPGSigningMechanism()
 		if err != nil {
 			return errors.Wrap(err, "Error initializing GPG")
@@ -493,6 +506,17 @@ func (ic *imageCopier) copyBlobFromStream(srcStream io.Reader, srcInfo types.Blo
 		destStream = pipeReader
 		inputInfo.Digest = ""
 		inputInfo.Size = -1
+	}
+
+	// === Report progress using the ic.progress channel, if required.
+	if ic.progress != nil && ic.progressInterval > 0 {
+		destStream = &progressReader{
+			source:   destStream,
+			channel:  ic.progress,
+			interval: ic.progressInterval,
+			artifact: srcInfo,
+			lastTime: time.Now(),
+		}
 	}
 
 	// === Finally, send the layer stream to dest.
