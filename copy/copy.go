@@ -46,6 +46,7 @@ type imageCopier struct {
 	diffIDsAreNeeded  bool
 	canModifyManifest bool
 	reportWriter      io.Writer
+	layerCopyHook     func(types.BlobInfo) bool
 }
 
 // newDigestingReader returns an io.Reader implementation with contents of source, which will eventually return a non-EOF error
@@ -93,6 +94,7 @@ type Options struct {
 	ReportWriter     io.Writer
 	SourceCtx        *types.SystemContext
 	DestinationCtx   *types.SystemContext
+	LayerCopyHook    func(types.BlobInfo) bool
 }
 
 // Image copies image from srcRef to destRef, using policyContext to validate source image admissibility.
@@ -174,6 +176,7 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 		diffIDsAreNeeded:  src.UpdatedImageNeedsLayerDiffIDs(manifestUpdates),
 		canModifyManifest: canModifyManifest,
 		reportWriter:      reportWriter,
+		layerCopyHook:     options.LayerCopyHook,
 	}
 
 	if err := ic.copyLayers(); err != nil {
@@ -241,28 +244,30 @@ func (ic *imageCopier) copyLayers() error {
 	destInfos := []types.BlobInfo{}
 	diffIDs := []digest.Digest{}
 	for _, srcLayer := range srcInfos {
-		var (
-			destInfo types.BlobInfo
-			diffID   digest.Digest
-			err      error
-		)
-		if ic.dest.AcceptsForeignLayerURLs() && len(srcLayer.URLs) != 0 {
-			// DiffIDs are, currently, needed only when converting from schema1.
-			// In which case src.LayerInfos will not have URLs because schema1
-			// does not support them.
-			if ic.diffIDsAreNeeded {
-				return errors.New("getting DiffID for foreign layers is unimplemented")
+		if ic.layerCopyHook == nil || ic.layerCopyHook(srcLayer) {
+			var (
+				destInfo types.BlobInfo
+				diffID   digest.Digest
+				err      error
+			)
+			if ic.dest.AcceptsForeignLayerURLs() && len(srcLayer.URLs) != 0 {
+				// DiffIDs are, currently, needed only when converting from schema1.
+				// In which case src.LayerInfos will not have URLs because schema1
+				// does not support them.
+				if ic.diffIDsAreNeeded {
+					return errors.New("getting DiffID for foreign layers is unimplemented")
+				}
+				destInfo = srcLayer
+				fmt.Fprintf(ic.reportWriter, "Skipping foreign layer %q copy to %s\n", destInfo.Digest, ic.dest.Reference().Transport().Name())
+			} else {
+				destInfo, diffID, err = ic.copyLayer(srcLayer)
+				if err != nil {
+					return err
+				}
 			}
-			destInfo = srcLayer
-			fmt.Fprintf(ic.reportWriter, "Skipping foreign layer %q copy to %s\n", destInfo.Digest, ic.dest.Reference().Transport().Name())
-		} else {
-			destInfo, diffID, err = ic.copyLayer(srcLayer)
-			if err != nil {
-				return err
-			}
+			destInfos = append(destInfos, destInfo)
+			diffIDs = append(diffIDs, diffID)
 		}
-		destInfos = append(destInfos, destInfo)
-		diffIDs = append(diffIDs, diffID)
 	}
 	ic.manifestUpdates.InformationOnly.LayerInfos = destInfos
 	if ic.diffIDsAreNeeded {
