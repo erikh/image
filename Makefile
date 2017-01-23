@@ -10,6 +10,16 @@ BUILDFLAGS := -tags "$(BUILDTAGS)"
 
 all: deps .gitvalidation test validate
 
+godep:
+	go get -u github.com/tools/godep
+
+godep-restore: godep
+	godep restore ./...
+
+godep-save: godep
+	rm -rf vendor Godeps
+	godep save ./...
+
 deps:
 	go get -t $(BUILDFLAGS) ./...
 	go get -u $(BUILDFLAGS) github.com/golang/lint/golint
