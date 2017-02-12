@@ -103,7 +103,7 @@ type Options struct {
 }
 
 // Image copies image from srcRef to destRef, using policyContext to validate source image admissibility.
-func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageReference, options *Options) error {
+func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageReference, options *Options) (types.Image, error) {
 	if options == nil {
 		options = &Options{}
 	}
@@ -120,14 +120,14 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 
 	dest, err := destRef.NewImageDestination(options.DestinationCtx)
 	if err != nil {
-		return errors.Wrapf(err, "Error initializing destination %s", transports.ImageName(destRef))
+		return nil, errors.Wrapf(err, "Error initializing destination %s", transports.ImageName(destRef))
 	}
 	defer dest.Close()
 	destSupportedManifestMIMETypes := dest.SupportedManifestMIMETypes()
 
 	rawSource, err := srcRef.NewImageSource(options.SourceCtx, destSupportedManifestMIMETypes)
 	if err != nil {
-		return errors.Wrapf(err, "Error initializing source %s", transports.ImageName(srcRef))
+		return nil, errors.Wrapf(err, "Error initializing source %s", transports.ImageName(srcRef))
 	}
 	unparsedImage := image.UnparsedFromSource(rawSource)
 	defer func() {
@@ -138,17 +138,17 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 
 	// Please keep this policy check BEFORE reading any other information about the image.
 	if allowed, err := policyContext.IsRunningImageAllowed(unparsedImage); !allowed || err != nil { // Be paranoid and fail if either return value indicates so.
-		return errors.Wrap(err, "Source image rejected")
+		return nil, errors.Wrap(err, "Source image rejected")
 	}
 	src, err := image.FromUnparsedImage(unparsedImage)
 	if err != nil {
-		return errors.Wrapf(err, "Error initializing image from source %s", transports.ImageName(srcRef))
+		return nil, errors.Wrapf(err, "Error initializing image from source %s", transports.ImageName(srcRef))
 	}
 	unparsedImage = nil
 	defer src.Close()
 
 	if src.IsMultiImage() {
-		return errors.Errorf("can not copy %s: manifest contains multiple images", transports.ImageName(srcRef))
+		return nil, errors.Errorf("can not copy %s: manifest contains multiple images", transports.ImageName(srcRef))
 	}
 
 	var sigs [][]byte
@@ -158,14 +158,14 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 		writeReport("Getting image source signatures\n")
 		s, err := src.Signatures()
 		if err != nil {
-			return errors.Wrap(err, "Error reading signatures")
+			return nil, errors.Wrap(err, "Error reading signatures")
 		}
 		sigs = s
 	}
 	if len(sigs) != 0 {
 		writeReport("Checking if image destination supports signatures\n")
 		if err := dest.SupportsSignatures(); err != nil {
-			return errors.Wrap(err, "Can not copy signatures")
+			return nil, errors.Wrap(err, "Can not copy signatures")
 		}
 	}
 
@@ -173,7 +173,7 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 	manifestUpdates := types.ManifestUpdateOptions{}
 
 	if err := determineManifestConversion(&manifestUpdates, src, destSupportedManifestMIMETypes, canModifyManifest); err != nil {
-		return err
+		return nil, err
 	}
 
 	// If src.UpdatedImageNeedsLayerDiffIDs(manifestUpdates) will be true, it needs to be true by the time we get here.
@@ -193,62 +193,62 @@ func Image(policyContext *signature.PolicyContext, destRef, srcRef types.ImageRe
 	}
 
 	if err := ic.copyLayers(); err != nil {
-		return err
+		return nil, err
 	}
 
 	pendingImage := src
 	if !reflect.DeepEqual(manifestUpdates, types.ManifestUpdateOptions{InformationOnly: manifestUpdates.InformationOnly}) {
 		if !canModifyManifest {
-			return errors.Errorf("Internal error: copy needs an updated manifest but that was known to be forbidden")
+			return nil, errors.Errorf("Internal error: copy needs an updated manifest but that was known to be forbidden")
 		}
 		manifestUpdates.InformationOnly.Destination = dest
 		pendingImage, err = src.UpdatedImage(manifestUpdates)
 		if err != nil {
-			return errors.Wrap(err, "Error creating an updated image manifest")
+			return nil, errors.Wrap(err, "Error creating an updated image manifest")
 		}
 	}
 	manifest, _, err := pendingImage.Manifest()
 	if err != nil {
-		return errors.Wrap(err, "Error reading manifest")
+		return nil, errors.Wrap(err, "Error reading manifest")
 	}
 
 	if err := ic.copyConfig(pendingImage); err != nil {
-		return err
+		return nil, err
 	}
 
 	if options.SignBy != "" {
 		mech, err := signature.NewGPGSigningMechanism()
 		if err != nil {
-			return errors.Wrap(err, "Error initializing GPG")
+			return nil, errors.Wrap(err, "Error initializing GPG")
 		}
 		dockerReference := dest.Reference().DockerReference()
 		if dockerReference == nil {
-			return errors.Errorf("Cannot determine canonical Docker reference for destination %s", transports.ImageName(dest.Reference()))
+			return nil, errors.Errorf("Cannot determine canonical Docker reference for destination %s", transports.ImageName(dest.Reference()))
 		}
 
 		writeReport("Signing manifest\n")
 		newSig, err := signature.SignDockerManifest(manifest, dockerReference.String(), mech, options.SignBy)
 		if err != nil {
-			return errors.Wrap(err, "Error creating signature")
+			return nil, errors.Wrap(err, "Error creating signature")
 		}
 		sigs = append(sigs, newSig)
 	}
 
 	writeReport("Writing manifest to image destination\n")
 	if err := dest.PutManifest(manifest); err != nil {
-		return errors.Wrap(err, "Error writing manifest")
+		return nil, errors.Wrap(err, "Error writing manifest")
 	}
 
 	writeReport("Storing signatures\n")
 	if err := dest.PutSignatures(sigs); err != nil {
-		return errors.Wrap(err, "Error writing signatures")
+		return nil, errors.Wrap(err, "Error writing signatures")
 	}
 
 	if err := dest.Commit(); err != nil {
-		return errors.Wrap(err, "Error committing the finished image")
+		return nil, errors.Wrap(err, "Error committing the finished image")
 	}
 
-	return nil
+	return pendingImage, nil
 }
 
 // copyLayers copies layers from src/rawSource to dest, using and updating ic.manifestUpdates if necessary and ic.canModifyManifest.
